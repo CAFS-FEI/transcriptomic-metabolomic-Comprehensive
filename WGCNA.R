@@ -1,36 +1,96 @@
-
 .require_packages <- function(pkgs) {
   missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-  if (length(missing)) stop("缺少R包：", paste(missing, collapse = ", "))
+  if (length(missing)) stop("Missing required R packages: ", paste(missing, collapse = ", "))
 }
 
 .prepare_output_dir <- function(path) {
   if (dir.exists(path) && length(list.files(path, all.files = TRUE, no.. = TRUE))) {
-    stop("输出目录非空，请指定新目录：", path)
+    stop("Output directory is not empty; please specify a new directory: ", path)
   }
   dir.create(path, recursive = TRUE, showWarnings = FALSE)
   path
 }
 
 .ascii_input <- function(path) {
-  if (!file.exists(path)) stop("找不到输入文件：", path)
+  if (!file.exists(path)) stop("Input file not found: ", path)
   ext <- tools::file_ext(path)
   tmp <- tempfile(fileext = if (nzchar(ext)) paste0(".", ext) else "")
-  if (!file.copy(path, tmp, overwrite = TRUE)) stop("无法建立输入文件临时副本：", path)
+  if (!file.copy(path, tmp, overwrite = TRUE)) stop("Failed to create temporary copy of input file: ", path)
   tmp
 }
 
-.read_fpkm <- function(path) {
+.load_sample_info <- function(sample_info) {
+  if (is.character(sample_info) && length(sample_info) == 1L) {
+    tmp <- .ascii_input(sample_info); on.exit(unlink(tmp), add = TRUE)
+    ext <- tolower(tools::file_ext(sample_info))
+    info <- if (ext == "csv") {
+      read.csv(tmp, check.names = FALSE, stringsAsFactors = FALSE)
+    } else {
+      read.delim(tmp, check.names = FALSE, stringsAsFactors = FALSE)
+    }
+  } else if (is.data.frame(sample_info)) {
+    info <- sample_info
+  } else {
+    stop("sample_info must be a data.frame or a path to a CSV/TSV file with 'sample' and 'group' columns.")
+  }
+  if (!all(c("sample", "group") %in% names(info))) {
+    stop("sample_info must contain 'sample' and 'group' columns.")
+  }
+  info$sample <- as.character(info$sample)
+  info$group <- as.character(info$group)
+  if (anyNA(info$sample) || any(!nzchar(info$sample)) || anyDuplicated(info$sample)) {
+    stop("sample_info contains missing, empty, or duplicated sample IDs.")
+  }
+  info
+}
+
+.read_fpkm <- function(path, sample_cols = NULL) {
   tmp <- .ascii_input(path); on.exit(unlink(tmp), add = TRUE)
   x <- read.delim(tmp, check.names = FALSE, stringsAsFactors = FALSE)
-  sample_cols <- c("FI1", "FI2", "FI3", "LI1", "LI2")
-  if (!all(sample_cols %in% names(x))) stop("FPKM必须包含：", paste(sample_cols, collapse = ", "))
+  if (ncol(x) < 3L) stop("FPKM table must contain a gene ID column and numeric expression sample columns.")
   gene_col <- names(x)[1]
-  if (anyDuplicated(x[[gene_col]])) stop("FPKM基因ID存在重复：", gene_col)
+  if (anyDuplicated(x[[gene_col]])) stop("Duplicate gene IDs detected in FPKM table: ", gene_col)
+  if (is.null(sample_cols)) {
+    cand <- names(x)[-1]
+    sample_cols <- cand[vapply(x[cand], is.numeric, logical(1))]
+    if (!length(sample_cols)) stop("No numeric expression sample columns found in FPKM table.")
+  } else {
+    sample_cols <- as.character(sample_cols)
+    if (!all(sample_cols %in% names(x))) {
+      stop("Missing required sample columns in FPKM table: ",
+           paste(setdiff(sample_cols, names(x)), collapse = ", "))
+    }
+  }
   mat <- as.matrix(x[, sample_cols, drop = FALSE]); storage.mode(mat) <- "numeric"
   rownames(mat) <- x[[gene_col]]
-  if (any(!is.finite(mat))) stop("FPKM表达矩阵含非有限值。")
+  if (any(!is.finite(mat))) stop("FPKM expression matrix contains non-finite values.")
   mat
+}
+
+.resolve_groups <- function(sample_ids, sample_info = NULL) {
+  if (!is.null(sample_info)) {
+    info <- .load_sample_info(sample_info)
+    idx <- match(sample_ids, info$sample)
+    if (anyNA(idx)) {
+      stop("Some samples are missing from sample_info: ",
+           paste(sample_ids[is.na(idx)], collapse = ", "))
+    }
+    groups <- setNames(info$group[idx], sample_ids)
+  } else {
+    groups <- setNames(
+      ifelse(grepl("^F", sample_ids), "F",
+             ifelse(grepl("^L", sample_ids), "L", NA_character_)),
+      sample_ids
+    )
+    if (anyNA(groups)) {
+      stop("Unable to infer group labels from sample names; use 'F'/'L' prefixes or provide sample_info.")
+    }
+  }
+  if (!identical(sort(unique(groups)), c("F", "L"))) {
+    stop("Expected exactly two sample groups ('F' and 'L'); found: ",
+         paste(sort(unique(groups)), collapse = ", "))
+  }
+  groups
 }
 
 .module_map <- data.frame(
@@ -63,12 +123,12 @@
   required <- c("net", "filtered_expression", "sample_groups", "gene_ids",
                 "dendrogram_order", "module_colors", "module_mapping")
   miss <- setdiff(required, names(bundle))
-  if (length(miss)) stop("WGCNA对象缺少字段：", paste(miss, collapse = ", "))
-  if (length(bundle$gene_ids) != 22577L) stop("入网基因数不是22,577，而是：", length(bundle$gene_ids))
+  if (length(miss)) stop("WGCNA bundle is missing required fields: ", paste(miss, collapse = ", "))
+  if (length(bundle$gene_ids) != 22577L) stop("Expected 22,577 network genes, got: ", length(bundle$gene_ids))
   observed <- sort(unique(.bundle_colors(bundle)))
   observed <- setdiff(observed, "grey")
-  if (length(observed) != 16L) stop("非grey模块数不是16，而是：", length(observed))
-  if (!setequal(observed, .module_map$ModuleColor)) stop("模块颜色与固定ME映射不一致。")
+  if (length(observed) != 16L) stop("Expected 16 non-grey modules, got: ", length(observed))
+  if (!setequal(observed, .module_map$ModuleColor)) stop("Module colors do not match the fixed ME mapping.")
   invisible(TRUE)
 }
 
@@ -77,7 +137,7 @@
   groups <- bundle$sample_groups
   z <- t(scale(t(expr)))
   z[!is.finite(z)] <- 0
-  # image()从下向上绘制行，因此先放L、再放F，最终显示为上F、下L。
+  # image() plots rows from bottom to top; place L first and F second so F appears on top and L on bottom.
   group_means <- rbind(
     L = rowMeans(z[, names(groups)[groups == "L"], drop = FALSE]),
     F = rowMeans(z[, names(groups)[groups == "F"], drop = FALSE])
@@ -100,7 +160,6 @@
   image(t(group_means[, ord, drop = FALSE]), col = pal, zlim = c(-2, 2),
         axes = FALSE, xlab = "", ylab = "")
   axis(2, at = c(0, 1), labels = c("L", "F"), las = 1, tick = FALSE)
-  # 
   par(fig = c(0.022, 0.039, 0.074, 0.172), new = TRUE, mar = c(0, 0, 0, 0))
   image(1, seq(-2, 2, length.out = length(pal)),
         matrix(seq_along(pal), nrow = 1), col = pal, axes = FALSE,
@@ -110,21 +169,18 @@
   mtext("Z-score", side = 3, line = 0.2, cex = 0.52)
 }
 
-# Stage 01 — Fig.1A
+# Stage 01 - Fig.1A
 stage_01_fig1a <- function(fpkm_file, output_dir, existing_net_file = NULL,
-                           power = 12, min_module_size = 30, merge_cut_height = 0.25) {
+                           power = 12, min_module_size = 30, merge_cut_height = 0.25,
+                           sample_info = NULL) {
   .require_packages(c("WGCNA", "openxlsx"))
   out <- .prepare_output_dir(output_dir)
-  fpkm <- .read_fpkm(fpkm_file)
+  sample_cols <- if (!is.null(sample_info)) .load_sample_info(sample_info)$sample else NULL
+  fpkm <- .read_fpkm(fpkm_file, sample_cols = sample_cols)
   dat_expr <- as.data.frame(t(fpkm))
   qc <- WGCNA::goodSamplesGenes(dat_expr, verbose = 0)
   if (!qc$allOK) dat_expr <- dat_expr[qc$goodSamples, qc$goodGenes, drop = FALSE]
-  groups <- setNames(ifelse(grepl("^FI", rownames(dat_expr)), "F",
-                            ifelse(grepl("^LI", rownames(dat_expr)), "L", NA_character_)),
-                     rownames(dat_expr))
-  if (anyNA(groups) || !identical(sort(unique(groups)), c("F", "L"))) {
-    stop("样本名必须以FI或LI开头。")
-  }
+  groups <- .resolve_groups(rownames(dat_expr), sample_info = sample_info)
   if (is.null(existing_net_file)) {
     net <- WGCNA::blockwiseModules(
       dat_expr, power = power, maxBlockSize = 25000, TOMType = "unsigned",
@@ -138,7 +194,7 @@ stage_01_fig1a <- function(fpkm_file, output_dir, existing_net_file = NULL,
     net <- readRDS(tmp)
   }
   if (length(net$colors) != ncol(dat_expr)) {
-    stop("WGCNA网络对象与过滤后FPKM的基因数不一致。")
+    stop("Gene count in WGCNA network object does not match filtered FPKM expression matrix.")
   }
   colors <- WGCNA::labels2colors(net$colors)
   names(colors) <- colnames(dat_expr)
@@ -166,7 +222,7 @@ stage_01_fig1a <- function(fpkm_file, output_dir, existing_net_file = NULL,
   invisible(bundle)
 }
 
-# Stage 02 — Fig.1B
+# Stage 02 - Fig.1B
 stage_02_fig1b <- function(wgcna_rds, output_dir) {
   .require_packages(c("WGCNA", "openxlsx"))
   out <- .prepare_output_dir(output_dir)
@@ -177,8 +233,7 @@ stage_02_fig1b <- function(wgcna_rds, output_dir) {
   names(counts) <- c("ModuleColor", "GeneCount")
   counts <- merge(.module_map, counts, by = "ModuleColor", all.x = TRUE, sort = FALSE)
   counts <- counts[match(.module_map$ModuleColor, counts$ModuleColor), ]
-  if (anyNA(counts$GeneCount) || sum(counts$GeneCount) != 22577L) stop("模块计数校验失败。")
-  # 
+  if (anyNA(counts$GeneCount) || sum(counts$GeneCount) != 22577L) stop("Module gene count validation failed.")
   counts <- counts[order(-counts$GeneCount), , drop = FALSE]
   .save_table_pair(counts, file.path(out, "Fig1B_module_gene_counts"))
   draw <- function(path, type) {
@@ -222,7 +277,7 @@ stage_02_fig1b <- function(wgcna_rds, output_dir) {
   axis(4, at = c(-1, -0.5, 0, 0.5, 1), las = 1, tick = FALSE, cex.axis = 0.72)
 }
 
-# Stage 03 — Fig.1C
+# Stage 03 - Fig.1C
 stage_03_fig1c <- function(wgcna_rds, output_dir) {
   .require_packages(c("WGCNA", "openxlsx"))
   out <- .prepare_output_dir(output_dir)
@@ -234,7 +289,7 @@ stage_03_fig1c <- function(wgcna_rds, output_dir) {
   keep <- !is.na(display)
   mes <- mes[, keep, drop = FALSE]; display <- display[keep]
   ord <- match(.module_map$DisplayModule, display)
-  if (anyNA(ord)) stop("网络对象的模块特征向量无法完整映射到MEone–MEsixteen。")
+  if (anyNA(ord)) stop("Module eigengenes cannot be completely mapped to MEone-MEsixteen.")
   mes <- mes[, ord, drop = FALSE]
   traits <- cbind(F = as.integer(bundle$sample_groups[rownames(mes)] == "F"),
                   L = as.integer(bundle$sample_groups[rownames(mes)] == "L"))
